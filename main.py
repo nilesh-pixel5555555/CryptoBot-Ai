@@ -35,7 +35,9 @@ bot_stats = {
     "version": "V2.5 Premium Quant"
 }
 
-# ### NEW: List to track daily trades for the report
+# ---------------------------------------------------------
+# [ADDED] 1. List to store trades for the 24-hour report
+# ---------------------------------------------------------
 daily_trades = []
 
 # =========================================================================
@@ -74,46 +76,56 @@ def fetch_data_safe(symbol, timeframe):
             if attempt < max_retries - 1: time.sleep(5)
     return pd.DataFrame()
 
-# ### NEW: Function to check results and send report
+# ---------------------------------------------------------
+# [ADDED] 2. The Function that creates the 24-hour report
+# ---------------------------------------------------------
 def send_daily_report():
     global daily_trades
+    
+    # If no trades happened in 24 hours, do nothing (or you can send "No trades today")
     if not daily_trades:
-        return # No trades to report
+        return 
 
     wins = 0
-    total = len(daily_trades)
+    total_signals = len(daily_trades)
 
+    # Check which trades hit their target
     for trade in daily_trades:
         try:
-            # Check price history since the trade was taken
+            # Get latest data to see if price hit the target
             df = fetch_data_safe(trade['symbol'], '1h')
-            # Filter for data AFTER the trade signal time
+            # Look at data only AFTER the signal was sent
             future_data = df[df.index > trade['time']]
             
             if not future_data.empty:
                 if trade['side'] == 'BUY':
-                    # Did price hit TP1?
+                    # Did price go higher than TP?
                     if future_data['high'].max() >= trade['tp']:
                         wins += 1
                 else: # SELL
-                    # Did price hit TP1?
+                    # Did price go lower than TP?
                     if future_data['low'].min() <= trade['tp']:
                         wins += 1
         except:
             continue
 
+    # Create the message
     msg = (
-        f"📊 <b>DAILY RECAP</b>\n"
-        f"Trades: {total} | Targets Hit: {wins}\n"
-        f"Success Rate: {int((wins/total)*100) if total > 0 else 0}%"
+        f"📅 <b>DAILY TRADING REPORT</b>\n"
+        f"--------------------------\n"
+        f"Signals Sent: {total_signals}\n"
+        f"Targets Hit: {wins}\n"
+        f"--------------------------\n"
+        f"<i>Reseting for next 24h...</i>"
     )
     
+    # Send it
     try:
         asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML'))
     except Exception as e:
-        print(f"Report error: {e}")
+        print(f"Report Error: {e}")
     
-    # Reset for next day
+    # Reset the list for tomorrow
     daily_trades = []
 
 # =========================================================================
@@ -122,7 +134,7 @@ def send_daily_report():
 
 def generate_and_send_signal(symbol):
     global bot_stats
-    global daily_trades # ### NEW: Access the list
+    global daily_trades # Allow access to the list
     try:
         # 1. Fetch Multi-Timeframe Data
         df_4h = fetch_data_safe(symbol, TIMEFRAME_MAIN)
@@ -160,14 +172,11 @@ def generate_and_send_signal(symbol):
         sl = min(cpr['BC'], cpr['TC']) if is_buy else max(cpr['BC'], cpr['TC'])
 
         # --- PREMIUM HTML TEMPLATE ---
-        # Only send message if it matches your condition
-        if trend_4h == "BULLISH" and trend_1h == "BULLISH" and price > cpr['PP']:
-             signal = "STRONG BUY"
-        elif trend_4h == "BEARISH" and trend_1h == "BEARISH" and price < cpr['PP']:
-             signal = "STRONG SELL"
-
         if "STRONG" in signal:
-            # ### NEW: Save trade details to list
+            
+            # ---------------------------------------------------------
+            # [ADDED] 3. Save the trade details when a signal occurs
+            # ---------------------------------------------------------
             daily_trades.append({
                 'symbol': symbol,
                 'tp': tp1,
@@ -191,7 +200,7 @@ def generate_and_send_signal(symbol):
                 f"🔥 <b>Take Profit 2:</b> <code>{tp2:,.2f}</code>\n"
                 f"🛑 <b>Stop Loss:</b> <code>{sl:,.2f}</code>\n\n"
                 f"----------------------------------------\n"
-                f"<i>Powered by Advanced CryptoAibot</i>"
+                f"<i>Powered by Advanced CPR By Nilesh</i>"
             )
 
             asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
@@ -211,12 +220,14 @@ def start_bot():
     print(f"🚀 Initializing {bot_stats['version']}...")
     scheduler = BackgroundScheduler()
     for s in CRYPTOS:
-        # Schedule for every hour and half-hour
+        # Schedule for every hour and half-hour (THIS IS YOUR ORIGINAL 30 MIN LOGIC)
         scheduler.add_job(generate_and_send_signal, 'cron', minute='0,30', args=[s.strip()])
     
-    # ### NEW: Schedule the report every 24 hours
+    # ---------------------------------------------------------
+    # [ADDED] 4. Schedule the Report to run every 24 Hours
+    # ---------------------------------------------------------
     scheduler.add_job(send_daily_report, 'interval', hours=24)
-    
+
     scheduler.start()
     
     # Run first analysis immediately in the background
