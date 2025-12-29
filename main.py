@@ -3,7 +3,7 @@ import ccxt
 import pandas as pd
 import numpy as np
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Bot
 from flask import Flask, jsonify, render_template_string
@@ -34,6 +34,11 @@ bot_stats = {
     "uptime_start": datetime.now().isoformat(),
     "version": "V2.5 Premium Quant"
 }
+
+# -------------------------------------------------------------------------
+# [NEW FEATURE] 1. Global list to track trades for the report
+# -------------------------------------------------------------------------
+daily_trades = []
 
 # =========================================================================
 # === ADVANCED QUANT LOGIC ===
@@ -71,12 +76,69 @@ def fetch_data_safe(symbol, timeframe):
             if attempt < max_retries - 1: time.sleep(5)
     return pd.DataFrame()
 
+# -------------------------------------------------------------------------
+# [NEW FEATURE] 2. Function to generate and send the 24-hour report
+# -------------------------------------------------------------------------
+def send_daily_report():
+    global daily_trades
+    
+    # If no trades were recorded, we skip or send a "No trades" msg
+    if not daily_trades:
+        return 
+
+    wins = 0
+    total_signals = len(daily_trades)
+
+    # Loop through the saved trades to check if they won
+    for trade in daily_trades:
+        try:
+            # Fetch latest data
+            df = fetch_data_safe(trade['symbol'], '1h')
+            # Look at data strictly AFTER the trade signal was sent
+            future_data = df[df.index > trade['time']]
+            
+            if not future_data.empty:
+                if trade['side'] == 'BUY':
+                    # Check if Price went HIGHER than Take Profit 1
+                    if future_data['high'].max() >= trade['tp']:
+                        wins += 1
+                elif trade['side'] == 'SELL':
+                    # Check if Price went LOWER than Take Profit 1
+                    if future_data['low'].min() <= trade['tp']:
+                        wins += 1
+        except Exception as e:
+            print(f"Error checking trade outcome: {e}")
+
+    # Calculate Win Rate
+    win_rate = (wins / total_signals * 100) if total_signals > 0 else 0
+
+    # Build the Report Message
+    report_msg = (
+        f"📊 <b>DAILY PERFORMANCE REPORT</b>\n"
+        f"══════════════════════\n"
+        f"Signals Sent: <b>{total_signals}</b>\n"
+        f"Targets Hit: <b>{wins}</b>\n"
+        f"Win Rate: <b>{win_rate:.1f}%</b>\n"
+        f"══════════════════════\n"
+        f"<i>Counter reset for next 24h.</i>"
+    )
+    
+    # Send to Telegram
+    try:
+        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=report_msg, parse_mode='HTML'))
+    except Exception as e:
+        print(f"Failed to send report: {e}")
+    
+    # RESET THE COUNTER
+    daily_trades = []
+
 # =========================================================================
 # === MULTI-TIMEFRAME CONFLUENCE ENGINE ===
 # =========================================================================
 
 def generate_and_send_signal(symbol):
     global bot_stats
+    global daily_trades # Access the global list
     try:
         # 1. Fetch Multi-Timeframe Data
         df_4h = fetch_data_safe(symbol, TIMEFRAME_MAIN)
@@ -113,6 +175,17 @@ def generate_and_send_signal(symbol):
         tp2 = cpr['R2'] if is_buy else cpr['S2']
         sl = min(cpr['BC'], cpr['TC']) if is_buy else max(cpr['BC'], cpr['TC'])
 
+        # -------------------------------------------------------------------------
+        # [NEW FEATURE] 3. Save the trade details IF it is a Strong Signal
+        # -------------------------------------------------------------------------
+        if "STRONG" in signal:
+            daily_trades.append({
+                'symbol': symbol,
+                'time': df_1h.index[-1],
+                'side': 'BUY' if is_buy else 'SELL',
+                'tp': tp1
+            })
+
         # --- PREMIUM HTML TEMPLATE ---
         message = (
             f"╔════════════════════════════════╗\n"
@@ -130,7 +203,7 @@ def generate_and_send_signal(symbol):
             f"🔥 <b>Take Profit 2:</b> <code>{tp2:,.2f}</code>\n"
             f"🛑 <b>Stop Loss:</b> <code>{sl:,.2f}</code>\n\n"
             f"----------------------------------------\n"
-            f"<i>Powered by Advanced Cryptoaibot</i>"
+            f"<i>Powered by Advanced CryptoAiBot</i>"
         )
 
         asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
@@ -152,6 +225,12 @@ def start_bot():
     for s in CRYPTOS:
         # Schedule for every hour and half-hour
         scheduler.add_job(generate_and_send_signal, 'cron', minute='0,30', args=[s.strip()])
+    
+    # -------------------------------------------------------------------------
+    # [NEW FEATURE] 4. Schedule the Report to run every 24 hours
+    # -------------------------------------------------------------------------
+    scheduler.add_job(send_daily_report, 'interval', hours=24)
+
     scheduler.start()
     
     # Run first analysis immediately in the background
@@ -165,21 +244,4 @@ app = Flask(__name__)
 @app.route('/')
 def home():
     return render_template_string("""
-        <body style="font-family:sans-serif; background:#0f172a; color:#f8fafc; text-align:center; padding-top:100px;">
-            <div style="background:#1e293b; display:inline-block; padding:40px; border-radius:15px; border: 1px solid #334155;">
-                <h1 style="color:#22d3ee;">AI Quant Dashboard</h1>
-                <p style="font-size:1.2em;">Status: <span style="color:#4ade80;">Active</span></p>
-                <p>Analyses Streamed: <b>{{a}}</b></p>
-                <p>Version: <i>{{v}}</i></p>
-                <hr style="border-color:#334155;">
-                <p style="font-size:0.8em; color:#94a3b8;">{{t}}</p>
-            </div>
-        </body>
-    """, a=bot_stats['total_analyses'], v=bot_stats['version'], t=bot_stats['last_analysis'])
-
-@app.route('/health')
-def health(): return jsonify({"status": "healthy"}), 200
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+        <body style="font-family:sans-serif; background:#0f172a
