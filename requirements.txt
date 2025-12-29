@@ -7,4 +7,6 @@ python-telegram-bot
 APScheduler
 python-dotenv
 Flask
+
 gunicorn
+apscheduler
