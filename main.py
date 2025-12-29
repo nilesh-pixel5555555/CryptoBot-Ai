@@ -3,17 +3,17 @@ import ccxt
 import pandas as pd
 import numpy as np
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Bot
 from flask import Flask, jsonify, render_template_string
 import threading
 import time
-import traceback 
+import traceback
+from dotenv import load_dotenv
 
 # --- CONFIGURATION ---
-from dotenv import load_dotenv 
-load_dotenv() 
+load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -22,8 +22,18 @@ CRYPTOS = [s.strip() for s in os.getenv("CRYPTOS", "BTC/USDT,ETH/USDT,SOL/USDT")
 TIMEFRAME_MAIN = "4h"  # Major Trend
 TIMEFRAME_ENTRY = "1h" # Entry Precision
 
-# Initialize Bot and Exchange (Kraken Public)
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+# --- SAFETY CHECK ---
+if not TELEGRAM_BOT_TOKEN:
+    print("CRITICAL ERROR: TELEGRAM_BOT_TOKEN is missing from Environment Variables!")
+    # We do not stop execution here to allow Gunicorn to report the error in logs,
+    # but the bot will likely fail later.
+
+# Initialize Bot and Exchange
+try:
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+except Exception as e:
+    print(f"Error initializing Bot: {e}")
+
 exchange = ccxt.kraken({'enableRateLimit': True, 'rateLimit': 2000})
 
 bot_stats = {
@@ -35,17 +45,14 @@ bot_stats = {
     "version": "V2.5 Premium Quant"
 }
 
-# -------------------------------------------------------------------------
-# [NEW FEATURE] 1. Global list to track trades for the report
-# -------------------------------------------------------------------------
+# --- TRACKING LIST ---
 daily_trades = []
 
 # =========================================================================
-# === ADVANCED QUANT LOGIC ===
+# === LOGIC ===
 # =========================================================================
 
 def calculate_cpr_levels(df_daily):
-    """Calculates Daily Pivot Points for Professional Target Setting."""
     if df_daily.empty or len(df_daily) < 2: return None
     prev_day = df_daily.iloc[-2]
     H, L, C = prev_day['high'], prev_day['low'], prev_day['close']
@@ -59,7 +66,6 @@ def calculate_cpr_levels(df_daily):
     }
 
 def fetch_data_safe(symbol, timeframe):
-    """Robust fetcher with retries and Kraken ID normalization."""
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -76,75 +82,47 @@ def fetch_data_safe(symbol, timeframe):
             if attempt < max_retries - 1: time.sleep(5)
     return pd.DataFrame()
 
-# -------------------------------------------------------------------------
-# [NEW FEATURE] 2. Function to generate and send the 24-hour report
-# -------------------------------------------------------------------------
 def send_daily_report():
     global daily_trades
-    
-    # If no trades were recorded, we skip or send a "No trades" msg
     if not daily_trades:
         return 
 
     wins = 0
     total_signals = len(daily_trades)
 
-    # Loop through the saved trades to check if they won
     for trade in daily_trades:
         try:
-            # Fetch latest data
             df = fetch_data_safe(trade['symbol'], '1h')
-            # Look at data strictly AFTER the trade signal was sent
             future_data = df[df.index > trade['time']]
-            
             if not future_data.empty:
                 if trade['side'] == 'BUY':
-                    # Check if Price went HIGHER than Take Profit 1
                     if future_data['high'].max() >= trade['tp']:
                         wins += 1
                 elif trade['side'] == 'SELL':
-                    # Check if Price went LOWER than Take Profit 1
                     if future_data['low'].min() <= trade['tp']:
                         wins += 1
-        except Exception as e:
-            print(f"Error checking trade outcome: {e}")
+        except:
+            continue
 
-    # Calculate Win Rate
-    win_rate = (wins / total_signals * 100) if total_signals > 0 else 0
-
-    # Build the Report Message
-    report_msg = (
-        f"📊 <b>DAILY PERFORMANCE REPORT</b>\n"
-        f"══════════════════════\n"
-        f"Signals Sent: <b>{total_signals}</b>\n"
-        f"Targets Hit: <b>{wins}</b>\n"
-        f"Win Rate: <b>{win_rate:.1f}%</b>\n"
-        f"══════════════════════\n"
-        f"<i>Counter reset for next 24h.</i>"
+    msg = (
+        f"📅 <b>DAILY REPORT</b>\n"
+        f"Signals: {total_signals}\n"
+        f"Targets Hit: {wins}\n"
     )
-    
-    # Send to Telegram
     try:
-        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=report_msg, parse_mode='HTML'))
+        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML'))
     except Exception as e:
-        print(f"Failed to send report: {e}")
+        print(f"Report Error: {e}")
     
-    # RESET THE COUNTER
     daily_trades = []
-
-# =========================================================================
-# === MULTI-TIMEFRAME CONFLUENCE ENGINE ===
-# =========================================================================
 
 def generate_and_send_signal(symbol):
     global bot_stats
-    global daily_trades # Access the global list
+    global daily_trades
     try:
-        # 1. Fetch Multi-Timeframe Data
         df_4h = fetch_data_safe(symbol, TIMEFRAME_MAIN)
         df_1h = fetch_data_safe(symbol, TIMEFRAME_ENTRY)
         
-        # Fetch Daily for CPR Targets
         if not exchange.markets: exchange.load_markets()
         market_id = exchange.market(symbol)['id']
         ohlcv_d = exchange.fetch_ohlcv(market_id, '1d', limit=5)
@@ -153,12 +131,10 @@ def generate_and_send_signal(symbol):
 
         if df_4h.empty or df_1h.empty or cpr is None: return
 
-        # 2. Extract Key Values
         price = df_4h.iloc[-1]['close']
         trend_4h = "BULLISH" if df_4h.iloc[-1]['sma9'] > df_4h.iloc[-1]['sma20'] else "BEARISH"
         trend_1h = "BULLISH" if df_1h.iloc[-1]['sma9'] > df_1h.iloc[-1]['sma20'] else "BEARISH"
         
-        # 3. Master Signal Logic (Confluence)
         signal = "WAIT (Neutral)"
         emoji = "⏳"
         
@@ -169,44 +145,39 @@ def generate_and_send_signal(symbol):
             signal = "STRONG SELL"
             emoji = "🔻"
 
-        # 4. Calculate Risk/Reward Targets
         is_buy = "BUY" in signal
         tp1 = cpr['R1'] if is_buy else cpr['S1']
         tp2 = cpr['R2'] if is_buy else cpr['S2']
         sl = min(cpr['BC'], cpr['TC']) if is_buy else max(cpr['BC'], cpr['TC'])
 
-        # -------------------------------------------------------------------------
-        # [NEW FEATURE] 3. Save the trade details IF it is a Strong Signal
-        # -------------------------------------------------------------------------
         if "STRONG" in signal:
             daily_trades.append({
                 'symbol': symbol,
-                'time': df_1h.index[-1],
+                'tp': tp1,
                 'side': 'BUY' if is_buy else 'SELL',
-                'tp': tp1
+                'time': df_1h.index[-1]
             })
 
-        # --- PREMIUM HTML TEMPLATE ---
-        message = (
-            f"╔════════════════════════════════╗\n"
-            f"  🏆 <b>PREMIUM AI SIGNAL</b>\n"
-            f"╚════════════════════════════════╝\n\n"
-            f"<b>Asset:</b> {symbol}\n"
-            f"<b>Price:</b> <code>{price:,.2f}</code>\n\n"
-            f"--- 🚨 {emoji} <b>SIGNAL: {signal}</b> 🚨 ---\n\n"
-            f"<b>📈 CONFLUENCE ANALYSIS:</b>\n"
-            f"• 4H Trend: <code>{trend_4h}</code>\n"
-            f"• 1H Trend: <code>{trend_1h}</code>\n"
-            f"• Pivot: {'Above' if price > cpr['PP'] else 'Below'} PP\n\n"
-            f"<b>🎯 TRADE TARGETS:</b>\n"
-            f"✅ <b>Take Profit 1:</b> <code>{tp1:,.2f}</code>\n"
-            f"🔥 <b>Take Profit 2:</b> <code>{tp2:,.2f}</code>\n"
-            f"🛑 <b>Stop Loss:</b> <code>{sl:,.2f}</code>\n\n"
-            f"----------------------------------------\n"
-            f"<i>Powered by Advanced CryptoAiBot</i>"
-        )
+            message = (
+                f"╔════════════════════════════════╗\n"
+                f"  🏆 <b>PREMIUM AI SIGNAL</b>\n"
+                f"╚════════════════════════════════╝\n\n"
+                f"<b>Asset:</b> {symbol}\n"
+                f"<b>Price:</b> <code>{price:,.2f}</code>\n\n"
+                f"--- 🚨 {emoji} <b>SIGNAL: {signal}</b> 🚨 ---\n\n"
+                f"<b>📈 CONFLUENCE ANALYSIS:</b>\n"
+                f"• 4H Trend: <code>{trend_4h}</code>\n"
+                f"• 1H Trend: <code>{trend_1h}</code>\n"
+                f"• Pivot: {'Above' if price > cpr['PP'] else 'Below'} PP\n\n"
+                f"<b>🎯 TRADE TARGETS:</b>\n"
+                f"✅ <b>Take Profit 1:</b> <code>{tp1:,.2f}</code>\n"
+                f"🔥 <b>Take Profit 2:</b> <code>{tp2:,.2f}</code>\n"
+                f"🛑 <b>Stop Loss:</b> <code>{sl:,.2f}</code>\n\n"
+                f"----------------------------------------\n"
+                f"<i>Powered by Advanced CryptoBotAi</i>"
+            )
 
-        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
+            asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
         
         bot_stats['total_analyses'] += 1
         bot_stats['last_analysis'] = datetime.now().isoformat()
@@ -216,32 +187,37 @@ def generate_and_send_signal(symbol):
         print(f"❌ Analysis failed for {symbol}: {e}")
 
 # =========================================================================
-# === GUNICORN-SAFE INITIALIZATION ===
+# === STARTUP ===
 # =========================================================================
 
 def start_bot():
     print(f"🚀 Initializing {bot_stats['version']}...")
     scheduler = BackgroundScheduler()
     for s in CRYPTOS:
-        # Schedule for every hour and half-hour
         scheduler.add_job(generate_and_send_signal, 'cron', minute='0,30', args=[s.strip()])
     
-    # -------------------------------------------------------------------------
-    # [NEW FEATURE] 4. Schedule the Report to run every 24 hours
-    # -------------------------------------------------------------------------
     scheduler.add_job(send_daily_report, 'interval', hours=24)
-
     scheduler.start()
     
-    # Run first analysis immediately in the background
     for s in CRYPTOS:
         threading.Thread(target=generate_and_send_signal, args=(s.strip(),)).start()
 
-start_bot()
+# Only run start_bot if this is NOT being imported by gunicorn unexpectedly
+# (Though for this simple bot, we usually want it to run on import)
+try:
+    start_bot()
+except Exception as e:
+    print(f"Error starting bot threads: {e}")
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return render_template_string("""
-        <body style="font-family:sans-serif; background:#0f172a
+    return render_template_string("<h1>Bot Running</h1>")
+
+@app.route('/health')
+def health(): return jsonify({"status": "healthy"}), 200
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
